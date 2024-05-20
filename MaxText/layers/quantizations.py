@@ -94,6 +94,12 @@ def _get_quant_config(config):
       drhs_local_aqt = aqt_config.LocalAqt(
           contraction_axis_shard_count=config.quantization_local_shard_count
       )
+    
+    # Weight-only.
+    return aqt_config.dot_general_make(lhs_bits=None, rhs_bits=8)
+
+    # DRQ.
+    """
     return aqt_config.config_v3(
         fwd_bits=8,
         dlhs_bits=8,
@@ -105,6 +111,7 @@ def _get_quant_config(config):
         dlhs_accumulator_dtype=jnp.int32,
         drhs_accumulator_dtype=drhs_accumulator_dtype,
     )
+    """
   elif config.quantization == "fp8":
     return "fp8"
   else:
