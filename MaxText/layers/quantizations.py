@@ -15,6 +15,7 @@
 """Quantization library."""
 
 import functools
+import json
 
 from aqt.jax.v2 import config as aqt_config
 from aqt.jax.v2.flax import aqt_flax
@@ -23,6 +24,7 @@ from dataclasses import dataclass
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import re
 from jax.tree_util import tree_flatten_with_path, tree_unflatten
 
 MAX_INT8 = 127.5
@@ -41,17 +43,35 @@ class Quantization:
 class AqtQuantization:
   """Configures AQT quantization github.com/google/aqt."""
 
-  quant_dg: aqt_config.DotGeneral
+  quant_dg: aqt_config.DotGeneral | dict
   quant_mode: aqt_flax.QuantMode = aqt_flax.QuantMode.TRAIN
 
   def dot_general_cls(self):
     """Returns dot_general configured with aqt params."""
+    if isinstance(self.quant_dg, dict):
+      # Mixed precision.
+      quant_dg = None
+      tile_size = -1
+      module_path = '/'.join(nn.module._context.module_stack[-1].path)
+      for layer_name_re, layer_quant_dg in self.quant_dg.items():
+        if re.fullmatch(layer_name_re, module_path):
+          quant_dg, tile_size = layer_quant_dg
+      if quant_dg is None:
+        quant_dg, tile_size = self.quant_dg['default']
+    else:
+      quant_dg = self.quant_dg
+    
+    print(f"============= {module_path} tile size: {tile_size}")
+    if tile_size == -1:
+      tile_size = None
+
     aqt_dg_cls = functools.partial(
         aqt_flax.AqtDotGeneral,
-        self.quant_dg,
+        quant_dg,
         rhs_quant_mode=self.quant_mode,
         lhs_freeze_mode=aqt_flax.FreezerMode.NONE,
         rhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION_AND_VALUE,
+        tile_size=tile_size
     )
     return aqt_dg_cls
 
@@ -79,11 +99,33 @@ class Fp8Quantization(Quantization):
     return nn.Fp8DotGeneralOp
 
 
+def _get_weight_only_quant_config(lhs_bits=None, rhs_bits=None):
+  return aqt_config.dot_general_make(lhs_bits=lhs_bits, rhs_bits=rhs_bits)
+
 def _get_quant_config(config):
   """Set quantization params based on user configuration."""
+  # This should be able to return a "dictionary", which maps regular expression key to value.
   if not config.quantization or config.quantization == "":
     return None
   elif config.quantization == "int8":
+    if config.mixed_precision_config != "":
+      with open(config.mixed_precision_config, "r") as fin:
+        mixed_precision_config = json.load(fin)
+      
+      ret_config = {}
+      for layer_name_re, layer_quantization_config in mixed_precision_config.items():
+        rhs_num_bits = layer_quantization_config.get("bits", 8)
+        tile_size = layer_quantization_config.get("tile_size", -1)
+        ret_config[layer_name_re] = [aqt_config.dot_general_make(lhs_bits=None, rhs_bits=rhs_num_bits), tile_size]
+
+      ret_config["default"] = [aqt_config.dot_general_make(lhs_bits=None, rhs_bits=8), -1]
+      return ret_config
+
+    # Weight-only for the whole network.
+    return aqt_config.dot_general_make(lhs_bits=None, rhs_bits=8)
+
+    # DRQ.
+    """
     if config.quantization_local_shard_count == 0:
       drhs_bits = None
       drhs_accumulator_dtype = None
@@ -95,11 +137,8 @@ def _get_quant_config(config):
           contraction_axis_shard_count=config.quantization_local_shard_count
       )
     
-    # Weight-only.
-    return aqt_config.dot_general_make(lhs_bits=None, rhs_bits=8)
 
-    # DRQ.
-    """
+    
     return aqt_config.config_v3(
         fwd_bits=8,
         dlhs_bits=8,
