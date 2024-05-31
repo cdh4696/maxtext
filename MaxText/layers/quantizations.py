@@ -17,7 +17,9 @@
 import functools
 import json
 
+from aqt.jax.v2 import aqt_tensor
 from aqt.jax.v2 import config as aqt_config
+from aqt.jax.v2 import tiled_dot_general
 from aqt.jax.v2.flax import aqt_flax
 from common_types import Array, Config
 from dataclasses import dataclass
@@ -28,6 +30,7 @@ import re
 from jax.tree_util import tree_flatten_with_path, tree_unflatten
 
 MAX_INT8 = 127.5
+MAX_INT4 = 7.5
 
 
 @dataclass
@@ -37,6 +40,28 @@ class Quantization:
   def dot_general_cls(self):
     """Placeholder for dot_general implementation in subclasses."""
     pass
+
+
+def _tiling_fn(lhs, rhs, dimension_numbers, tile_size):
+  del lhs, rhs
+  
+  (lhs_ca, rhs_ca), _ = dimension_numbers
+  ret = tiled_dot_general.Cfg(
+      lhs=tiled_dot_general.TensorTiling(contraction_axes=[], remaining_axes=[]),
+      rhs=tiled_dot_general.TensorTiling(contraction_axes=[], remaining_axes=[]),
+  )
+  
+  for lhs_idx, rhs_idx in zip(lhs_ca, rhs_ca):
+    ret.lhs.contraction_axes.append(
+        tiled_dot_general.AxisTiling(axis=lhs_idx, tile_size=tile_size, tile_count=None)
+    )
+    ret.rhs.contraction_axes.append(
+        tiled_dot_general.AxisTiling(
+            axis=rhs_idx, tile_size=tile_size, tile_count=None
+        )
+    )
+
+  return ret
 
 
 @dataclass
@@ -60,10 +85,10 @@ class AqtQuantization:
         quant_dg, tile_size = self.quant_dg['default']
     else:
       quant_dg = self.quant_dg
-    
-    print(f"============= {module_path} tile size: {tile_size}")
-    if tile_size == -1:
-      tile_size = None
+     
+    tiling_fn = None
+    if tile_size != -1:
+      tiling_fn = functools.partial(_tiling_fn, tile_size=tile_size)
 
     aqt_dg_cls = functools.partial(
         aqt_flax.AqtDotGeneral,
@@ -71,7 +96,7 @@ class AqtQuantization:
         rhs_quant_mode=self.quant_mode,
         lhs_freeze_mode=aqt_flax.FreezerMode.NONE,
         rhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION_AND_VALUE,
-        tile_size=tile_size
+        tiling_fn=tiling_fn
     )
     return aqt_dg_cls
 
@@ -219,16 +244,65 @@ def remove_quantized_params(params, aqt_vars):
 
 def configure_kv_quantization(config: Config):
   """Configure kv quantization based on user config."""
-  return False if not config.quantize_kvcache else True
+  return config.quantize_kvcache
 
 
-def quantize_kv(kv: Array):
+def get_kvcache_dtype(quantize_kvcache: str):
+  if quantize_kvcache == "int8":
+    return jnp.int8
+  elif quantize_kvcache == "int4":
+    return jnp.int4
+
+  raise "Unknown KVCache Quantization Option: {quantize_kvcache}. Should be either 'int8', 'int4' or ''."
+
+
+def quantize_kv(kv: Array, quantize_kvcache: str):
   """Quantize key/values stored in kvcache."""
   scale = jnp.max(jnp.abs(kv), axis=-1, keepdims=True)
-  value = jnp.int8(jnp.rint(kv * (MAX_INT8 / scale)))
-  return value, scale
+  if quantize_kvcache == "int8":
+    value = jnp.int8(jnp.rint(kv * (MAX_INT8 / scale)))
+  elif quantize_kvcache == "int4":
+    print("========= QUANTIZING KVCACHE to INT4")
+    value = jnp.int4(jnp.rint(kv * (MAX_INT4 / scale)))
+  else:
+    raise "Unknown KVCache Quantization Option: {quantize_kvcache}. Should be either 'int8', 'int4' or ''."
 
+  return value, scale
 
 def unquantize_kv(value: Array, scale: Array, dtype: jnp.dtype):
   """Unquantize key/values stored in kvcache."""
-  return value.astype(dtype) * scale / MAX_INT8
+  # I do not know what 'dtype' here means, but its value is quite unpredictable...
+  if value.dtype == jnp.int8:
+    return value.astype(dtype) * scale / MAX_INT8
+  elif value.dtype == jnp.int4:
+    # int4 must be explicitly casted to float before multiplication.
+    return value.astype(scale.dtype) * scale / MAX_INT4
+  
+  raise f"Bad quantized dtype: {value.dtype}"
+
+
+
+# Replacing the above code with QTensor *significantly* slows down the running speed - why?
+"""
+def quantize_kv(kv: Array, quantize_kvcache: str):
+  kvcache_dtype = get_kvcache_dtype(quantize_kvcache)
+  num_bits = 8 if kvcache_dtype == jnp.int8 else 4
+
+  # Only preserve max val for 8-bit quantization; for 4-bit quant, we want to
+  # use the Q=7.5 value specifically, hence preserve_max_val=False if k4v4.
+  quantizer = aqt_config.quantizer_make(num_bits,
+                                        preserve_max_val=num_bits == 8)
+  qt, _ = quantizer.quant(kv, calibration_axes=[-1])
+  assert len(qt.scale) == 1
+  qvalue_dtype = quantizer.numerics.get_dtype()
+  qt = qt.qvalue_astype(qvalue_dtype)
+
+  print("======= KVCache quantized to: ", qt.qvalue.dtype, quantize_kvcache)
+
+  return qt.qvalue, qt.scale[0]
+
+def unquantize_kv(value: Array, scale: Array, dtype: jnp.dtype):
+  qt = aqt_tensor.QTensor(qvalue=value, scale=[scale], scale_t=None, dequant_dtype=dtype)
+
+  return qt.dequant()
+"""

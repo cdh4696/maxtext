@@ -107,7 +107,7 @@ class AttentionOp(nn.Module):
   dropout_rate: float = 0.0
   dtype: DType = jnp.float32
   quant: Optional[Quant] = None
-  quantize_kvcache: bool = False
+  quantize_kvcache: str = ""
 
   def check_attention_inputs(self, query: Array, key: Array, value: Array) -> None:
     """Check attention inputs."""
@@ -392,7 +392,7 @@ class AttentionOp(nn.Module):
     return (kv_shape[1], kv_shape[2], kv_shape[0], kv_shape[3])
 
   def _get_prefill_cache(self, batch, heads, kv_head_size, quantize_kvcache):
-    dtype = jnp.int8 if quantize_kvcache else jnp.bfloat16
+    dtype = quantizations.get_kvcache_dtype(quantize_kvcache)
 
     kv_cache_layout = (
         "cache_sequence",
@@ -449,7 +449,7 @@ class AttentionOp(nn.Module):
     return key_vars, value_vars, cached_segment_id
 
   def _get_ar_cache(self, batch, heads, kv_head_size, quantize_kvcache):
-    dtype = jnp.int8 if quantize_kvcache else jnp.bfloat16
+    dtype = quantizations.get_kvcache_dtype(quantize_kvcache)
     cache_length = self.max_target_length - self.max_prefill_predict_length
     kv_cache_layout = (
         "cache_sequence",
@@ -557,8 +557,8 @@ class AttentionOp(nn.Module):
     value_shaped_for_cache = self.move_kvlen_axis(value)
 
     if self.quantize_kvcache:
-      key_shaped_for_cache, key_scale = quantizations.quantize_kv(key_shaped_for_cache)
-      value_shaped_for_cache, value_scale = quantizations.quantize_kv(value_shaped_for_cache)
+      key_shaped_for_cache, key_scale = quantizations.quantize_kv(key_shaped_for_cache, self.quantize_kvcache)
+      value_shaped_for_cache, value_scale = quantizations.quantize_kv(value_shaped_for_cache, self.quantize_kvcache)
       cached_prefill_key_var[1].value = key_scale
       cached_prefill_value_var[1].value = value_scale
 
@@ -600,8 +600,8 @@ class AttentionOp(nn.Module):
     one_token_value = self.move_kvlen_axis(one_token_value)
 
     if self.quantize_kvcache:
-      one_token_key, one_token_key_scale = quantizations.quantize_kv(one_token_key)
-      one_token_value, one_token_value_scale = quantizations.quantize_kv(one_token_value)
+      one_token_key, one_token_key_scale = quantizations.quantize_kv(one_token_key, self.quantize_kvcache)
+      one_token_value, one_token_value_scale = quantizations.quantize_kv(one_token_value, self.quantize_kvcache)
 
     one_hot_indices = one_hot_indices.astype(int)
 
@@ -830,7 +830,7 @@ class Attention(nn.Module):
   float32_qk_product: bool = False  # computes logits in float32 for stability.
   float32_logits: bool = False  # cast logits in float32 for stability.
   quant: Optional[Quant] = None
-  quantize_kvcache: bool = False
+  quantize_kvcache: str = ""
 
   query_axis_names: AxisNames = (BATCH, LENGTH, HEAD, D_KV)
   key_axis_names: AxisNames = (BATCH, LENGTH, HEAD, D_KV)
