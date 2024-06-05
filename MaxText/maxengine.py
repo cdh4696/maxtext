@@ -34,6 +34,8 @@ from jetstream.engine import tokenizer_pb2
 import max_utils
 import inference_utils
 
+import orbax
+from flax.training import orbax_utils
 
 Prefix = Any
 Params = Any
@@ -78,6 +80,10 @@ class MaxEngine(engine_api.Engine):
   def load_params(self, *args, **kwargs) -> Params:
     """Load Parameters, typically from GCS"""
     # pylint: disable=unused-argument
+    if self.config.load_from_quantized_checkpoint:
+      print("Loading from the quantized checkpoint...")
+      self.model.quant.quant_mode = quantizations.get_quant_mode("serve")
+
     state, self.state_mesh_annotations = max_utils.setup_decode_state(self.model, self.config, self.rng, self._mesh, None)
     self.abstract_params = jax.tree_util.tree_map(
         lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), state.params
@@ -86,12 +92,14 @@ class MaxEngine(engine_api.Engine):
     self.kv_cache_shardings = jax.tree_util.tree_map(
       lambda x: jax.sharding.NamedSharding(self._mesh, x), self.kv_cache_annotations)
 
-    if not self.model.quant:
+    if not self.model.quant or self.config.load_from_quantized_checkpoint:
+      # If the checkpoint is being loaded from the quantized checkpoint, we do not need to do additional quantization.
       self.abstract_params = jax.tree_util.tree_map(
           lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), state.params
       )
       return state.params
     else:
+      # Convert the model into quantized model.
       self.model.quant.quant_mode = quantizations.get_quant_mode("convert")
 
       @jax.jit
@@ -117,6 +125,15 @@ class MaxEngine(engine_api.Engine):
       self.abstract_params = jax.tree_util.tree_map(
           lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), params
       )
+
+      # Save the quantized checkpoint, if necessary.
+      if self.config.save_quantized_checkpoint:
+        orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        save_args = orbax_utils.save_args_from_target({"params":params})
+        orbax_checkpointer.save(
+            self.config.save_quantized_checkpoint, {"params":params}, save_args=save_args, force=True
+        )
+        print("QUANTIZED CHECKPOINT SAVED AT: ", self.config.save_quantized_checkpoint)
 
       self.model.quant.quant_mode = quantizations.get_quant_mode("serve")
       return params
