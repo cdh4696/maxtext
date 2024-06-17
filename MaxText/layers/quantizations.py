@@ -252,8 +252,11 @@ def get_kvcache_dtype(quantize_kvcache: str):
     return jnp.int8
   elif quantize_kvcache == "int4":
     return jnp.int4
+  elif quantize_kvcache == "":
+    return jnp.bfloat16
 
-  raise "Unknown KVCache Quantization Option: {quantize_kvcache}. Should be either 'int8', 'int4' or ''."
+  print("====== QUANTIZE_KVCACHE_VALUE: [" + quantize_kvcache + "]")
+  raise f"Unknown KVCache Quantization Option: {quantize_kvcache}. Should be either 'int8', 'int4' or ''."
 
 
 def quantize_kv(kv: Array, quantize_kvcache: str):
@@ -265,7 +268,7 @@ def quantize_kv(kv: Array, quantize_kvcache: str):
     print("========= QUANTIZING KVCACHE to INT4")
     value = jnp.int4(jnp.rint(kv * (MAX_INT4 / scale)))
   else:
-    raise "Unknown KVCache Quantization Option: {quantize_kvcache}. Should be either 'int8', 'int4' or ''."
+    raise f"Unknown KVCache Quantization Option: {quantize_kvcache}. Should be either 'int8', 'int4' or ''."
 
   return value, scale
 
