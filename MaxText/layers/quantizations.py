@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import re
 from jax.tree_util import tree_flatten_with_path, tree_unflatten
+from jax.sharding import PartitionSpec
 
 MAX_INT8 = 127.5
 MAX_INT4 = 7.5
@@ -283,9 +284,7 @@ def unquantize_kv(value: Array, scale: Array, dtype: jnp.dtype):
   
   raise f"Bad quantized dtype: {value.dtype}"
 
-
-
-# Replacing the above code with QTensor *significantly* slows down the running speed - why?
+# Replacing the above code with QTensor *significantly* slows down the running speed - Sharding issue possibly.
 """
 def quantize_kv(kv: Array, quantize_kvcache: str):
   kvcache_dtype = get_kvcache_dtype(quantize_kvcache)
@@ -309,3 +308,20 @@ def unquantize_kv(value: Array, scale: Array, dtype: jnp.dtype):
 
   return qt.dequant()
 """
+
+def update_aqt_annotations(config, state_logical_annotations):
+  mlp_weight_in_spec = PartitionSpec('embed', 'mlp')
+  mlp_weight_out_spec = PartitionSpec('mlp', 'embed')
+  attention_weight_qkv_spec = PartitionSpec('embed', 'heads', 'kv')
+  attention_weight_out_spec = PartitionSpec('heads', 'kv', 'embed')
+  num_layers = config.base_num_decoder_layers
+  # TBD - sharding for the scale.
+  for i in range(num_layers):
+    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['mlp']['wi_0']['AqtDotGeneral_0']['qrhs']['value'] = mlp_weight_in_spec
+    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['mlp']['wi_1']['AqtDotGeneral_0']['qrhs']['value'] = mlp_weight_in_spec
+    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['mlp']['wo']['AqtDotGeneral_0']['qrhs']['value'] = mlp_weight_out_spec
+    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['self_attention']['query']['AqtDotGeneral_0']['qrhs']['value'] = attention_weight_qkv_spec
+    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['self_attention']['key']['AqtDotGeneral_0']['qrhs']['value'] = attention_weight_qkv_spec
+    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['self_attention']['value']['AqtDotGeneral_0']['qrhs']['value'] = attention_weight_qkv_spec
+    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['self_attention']['out']['AqtDotGeneral_0']['qrhs']['value'] = attention_weight_qkv_spec
+  return state_logical_annotations

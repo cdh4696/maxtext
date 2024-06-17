@@ -35,14 +35,16 @@ load_parameters_path: ""
 # e.g. gs://my-base-output-directory/my-previous-run-name/checkpoints/items/NUMBER or NUMBER/items
 load_full_state_path: ""
 
-# If enable_checkpointing is true, an asynchronous checkpointer will be used if
-# async_checkpointing is true, else a synchronous one is used. If you have
+
 # problems with the checkpointer we recommend trying the synchronous one.
 enable_checkpointing: True
 async_checkpointing: True
 checkpoint_period: 10_000
 # enables one replica to read the ckpt then broadcast to the rest
 enable_single_replica_ckpt_restoring: False
+
+load_from_quantized_checkpoint: false # If true, loading from the quantized checkpoint.
+save_quantized_checkpoint: "" # If set, store the quantized checkpoint to the designated location
 
 force_unroll: False # during generate_param_only_checkpoint should we unroll the loop?
 ############################### END CHECKPOINTING ##################################
@@ -81,6 +83,7 @@ head_dim: 128
 # mixture of experts (moe)
 num_experts: 1
 num_experts_per_tok: 1
+moe_matmul: False
 mlp_activations: ["silu", "linear"]
 dropout_rate: 0
 logits_via_embedding: False
@@ -157,19 +160,28 @@ ici_autoregressive_parallelism: 1
 # you should set compile_toplogy_num_slices, which will in turn set this value. For non-TPU environments this is set to 1.
 num_slices: -1
 
-# Dataset
+# Tokenizer and Dataset
 # Replace with your path given as argument in download_dataset.sh, e.g. "gs://my-maxtext-dataset/"
-dataset_path: ""
 vocab_size: 32_000 # powers of 2 for sharding
 tokenizer_path: "assets/tokenizer.llama2"
-dataset_name: 'c4/en:3.0.1'
-eval_dataset_name: 'c4/en:3.0.1'
-eval_split: 'validation'
 per_device_batch_size: 12.0
 expansion_factor_real_data: -1 # if -1 then all hosts will load real data, else total_hosts//expansion_factor_real_data will pull data from GCS.
 eval_per_device_batch_size: 0
 max_corpus_chars: 10_000_000
-dataset_type: c4 # must be c4 or synthetic
+# dataset_type must be c4, c4-array_record, hf or synthetic
+# details in: https://github.com/google/maxtext/blob/main/getting_started/Data_Input_Pipeline.md
+dataset_type: c4
+# for TFDS input pipeline (dataset_type=c4) and Grain input pipeline (dataset_type:c4-array_record)
+# TODO (aireenmei): will rename the flags to be more clear (corresponding to each input pipeline)
+dataset_path: ""
+dataset_name: 'c4/en:3.0.1'
+eval_dataset_name: 'c4/en:3.0.1'
+eval_split: 'validation'
+# for HuggingFace input pipeline (dataset_type=hf)
+hf_path: ''
+hf_data_dir: ''
+hf_data_files: ''
+hf_access_token: ''
 
 # Setting for grain
 grain_worker_count: 4
@@ -198,8 +210,12 @@ load_from_prefill_dir: False # If true, decode.py doesn't "prefill" but just rea
 prefill_cache_dir: "" # If set and load_from_prefill_dir, decode.py reads from directory. If set, decode.py writes to directory
 autoregressive_decode_assert: ""
 
-enable_profiler: False
-# If set to true, upload all profiler xplane results from all hosts. Otherwise, only upload the xplane result from the first host.
+# For nsys profiler, pass the training command to nsys command
+# e.g. nsys profile -s none --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop {training command}
+profiler: "" # Supported profiler: '', xplane, nsys
+# output dir
+tensorboard_dir: /tmp/tensorboard
+# If set to true, upload all profiler results from all hosts. Otherwise, only upload the profiler result from the first host.
 upload_all_profiler_results: False
 # Skip first n steps for profiling, to omit things like compilation and to give
 # the iteration time a chance to stabilize.
@@ -264,7 +280,7 @@ vertex_tensorboard_project: ""
 # Vertex AI supported regions: https://cloud.google.com/vertex-ai/docs/general/locations#available-regions
 vertex_tensorboard_region: ""
 
-# If set to True, MaxText will perform extra checks using jax.checkify. Note that this will effect performance. 
+# If set to True, MaxText will perform extra checks using jax.checkify. Note that this will effect performance.
 max_checkify: False
 
 # Inference
@@ -272,3 +288,11 @@ inference_microbenchmark_prefill_lengths: "64,128,256,512,1024"
 inference_microbenchmark_stages: "prefill,generate"
 inference_microbenchmark_loop_iters: 10
 inference_microbenchmark_log_file_path: ""
+inference_benchmark_dataset_file_path: ""
+
+# Checkpoint Structured logging
+enable_checkpoint_cloud_logger: False
+enable_checkpoint_standard_logger: False
+
+# Single-controller
+enable_single_controller: False

@@ -18,6 +18,7 @@ limitations under the License.
 import checkpointing
 import common_types
 import functools
+import humanize
 import time
 import socket
 import subprocess
@@ -43,7 +44,7 @@ from typing import Tuple
 from tensorboardX import writer
 
 from google.cloud import storage
-
+from layers import quantizations
 
 def find_nans_and_infs(pytree):
   def finder(x):
@@ -85,18 +86,6 @@ def summarize_size_from_pytree(params):
   num_params = calculate_num_params_from_pytree(params)
   num_bytes = calculate_bytes_from_pytree(params)
   return num_params, num_bytes, num_bytes / num_params
-
-
-def activate_profiler(config, optional_postfix=""):
-  if config.enable_profiler and (config.upload_all_profiler_results or jax.process_index() == 0):
-    output_path = os.path.join(config.tensorboard_dir, optional_postfix)
-    jax.profiler.start_trace(output_path)
-
-
-def deactivate_profiler(config):
-  if config.enable_profiler and (config.upload_all_profiler_results or jax.process_index() == 0):
-    jax.profiler.stop_trace()
-
 
 def initialize_summary_writer(config):
   return writer.SummaryWriter(config.tensorboard_dir) if jax.process_index() == 0 else None
@@ -205,7 +194,8 @@ def maybe_initialize_jax_distributed_system(raw_keys):
   For CPUs, we call jax.distributed.initialize() explicitly, with the specified arguments.
   """
   if (
-      raw_keys["enable_checkpointing"] and raw_keys["async_checkpointing"] and raw_keys["compile_topology_num_slices"] == -1
+      raw_keys["enable_checkpointing"] and raw_keys["async_checkpointing"] and
+      raw_keys["compile_topology_num_slices"] == -1 and not raw_keys["enable_single_controller"]
   ) or raw_keys["hardware"] == "gpu_multiprocess":
     max_logging.log("Attempting to initialize the jax distributed system...")
     jax.distributed.initialize()
@@ -600,6 +590,9 @@ def get_abstract_state(model, tx, config, rng, mesh, is_training=True):
 
   state_logical_annotations = nn.get_partition_spec(abstract_state)
 
+  if config.load_from_quantized_checkpoint:
+    state_logical_annotations = quantizations.update_aqt_annotations(config, state_logical_annotations)
+
   state_mesh_shardings = nn.logical_to_mesh_sharding(state_logical_annotations, mesh, config.logical_axis_rules)
 
   abstract_sharded_state = jax.jit(init_state_partial, in_shardings=None, out_shardings=state_mesh_shardings).eval_shape(rng)
@@ -671,12 +664,21 @@ def summarize_pytree_data(params, name="Params", raw=False):
     num_params_in_billions = num_params / 1e9
     total_param_size_in_gb = total_param_size / 1e9
     print(f"{name} stats: \n"
-          f"\tTotal number of params: {num_params_in_billions:.3f} billion \n"	
-          f"\tTotal memory usage: {total_param_size_in_gb:.3f} GB \n"	
-          f"\tAvg size: {avg_param_size:.3f} bytes\n")	
+          f"\tTotal number of params: {num_params_in_billions:.3f} billion \n"
+          f"\tTotal memory usage: {total_param_size_in_gb:.3f} GB \n"
+          f"\tAvg size: {avg_param_size:.3f} bytes\n")
   else:
     print(f"{name} stats: \n"
             f"\tTotal number of params: {num_params:.3f} \n"
             f"\tTotal memory usage: {total_param_size:.3f} bytes \n"
             f"\tAvg size: {avg_param_size:.3f} bytes\n")
   return num_params, total_param_size, avg_param_size
+
+def print_mem_stats():
+  fmt_size = functools.partial(humanize.naturalsize, binary=True)
+  for d in jax.local_devices():
+    stats = d.memory_stats()
+    used = stats['bytes_in_use']
+    limit = stats['bytes_limit']
+    print(f"Using {fmt_size(used)} / {fmt_size(limit)} ({used/limit:%}) on {d}")
+
