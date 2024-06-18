@@ -589,12 +589,7 @@ def get_abstract_state(model, tx, config, rng, mesh, is_training=True):
     abstract_state = jax.eval_shape(init_state_partial, rng)
 
   state_logical_annotations = nn.get_partition_spec(abstract_state)
-
-  if config.load_from_quantized_checkpoint:
-    state_logical_annotations = quantizations.update_aqt_annotations(config, state_logical_annotations)
-
   state_mesh_shardings = nn.logical_to_mesh_sharding(state_logical_annotations, mesh, config.logical_axis_rules)
-
   abstract_sharded_state = jax.jit(init_state_partial, in_shardings=None, out_shardings=state_mesh_shardings).eval_shape(rng)
 
   unboxed_abstract_sharded_state = unbox_logicallypartioned(abstract_sharded_state)

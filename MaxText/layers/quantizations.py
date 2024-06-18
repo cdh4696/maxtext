@@ -29,6 +29,7 @@ import jax.numpy as jnp
 import re
 from jax.tree_util import tree_flatten_with_path, tree_unflatten
 from jax.sharding import PartitionSpec
+from typing import Tuple, Sequence
 
 MAX_INT8 = 127.5
 MAX_INT4 = 7.5
@@ -65,6 +66,23 @@ def _tiling_fn(lhs, rhs, dimension_numbers, tile_size):
   return ret
 
 
+def _rhs_axis_metadata_wrapper(x: jnp.ndarray, no_sharding_axis: Sequence[int], mesh_axes: Tuple[str, ...], is_tiled: bool):
+  mesh_axes = list(mesh_axes)
+  if is_tiled:
+    # The original rank of x will be doubled, e.x. [a, b, c] --> [_, a', _, b', _, c'].
+    # The mesh axes should be doubled too.
+    assert len(x.shape) >= 2 * len(mesh_axes)
+    mesh_axes = [None] * (len(x.shape) - 2 * len(mesh_axes)) + sum(
+        ([None, axis] for axis in mesh_axes), []
+    )
+          
+  if mesh_axes is not None and len(mesh_axes) > 0:
+    for no_shard_idx in no_sharding_axis:
+      mesh_axes[no_shard_idx] = None
+      
+  return nn.with_logical_partitioning((lambda: x), mesh_axes)()   
+
+
 @dataclass
 class AqtQuantization:
   """Configures AQT quantization github.com/google/aqt."""
@@ -72,24 +90,31 @@ class AqtQuantization:
   quant_dg: aqt_config.DotGeneral | dict
   quant_mode: aqt_flax.QuantMode = aqt_flax.QuantMode.TRAIN
 
-  def dot_general_cls(self):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
     """Returns dot_general configured with aqt params."""
+    quant_dg, tile_size, tiling_fn = None, -1, None
+
     if isinstance(self.quant_dg, dict):
       # Mixed precision.
-      quant_dg = None
-      tile_size = -1
       module_path = '/'.join(nn.module._context.module_stack[-1].path)
       for layer_name_re, layer_quant_dg in self.quant_dg.items():
         if re.fullmatch(layer_name_re, module_path):
           quant_dg, tile_size = layer_quant_dg
       if quant_dg is None:
         quant_dg, tile_size = self.quant_dg['default']
+      if tile_size != -1:
+        tiling_fn = functools.partial(_tiling_fn, tile_size=tile_size)
     else:
       quant_dg = self.quant_dg
-     
-    tiling_fn = None
-    if tile_size != -1:
-      tiling_fn = functools.partial(_tiling_fn, tile_size=tile_size)
+    
+    if self.quant_mode == aqt_flax.QuantMode.CONVERT:
+      # Sharding during convert leads to strange behavior when saving
+      # the quantized checkpoint.
+      rhs_axis_metadata_wrapper = None
+    else:
+      rhs_axis_metadata_wrapper = functools.partial(
+        _rhs_axis_metadata_wrapper, mesh_axes=mesh_axes, is_tiled=tile_size != -1
+      )
 
     aqt_dg_cls = functools.partial(
         aqt_flax.AqtDotGeneral,
@@ -97,18 +122,31 @@ class AqtQuantization:
         rhs_quant_mode=self.quant_mode,
         lhs_freeze_mode=aqt_flax.FreezerMode.NONE,
         rhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION_AND_VALUE,
+        rhs_axis_metadata_wrapper=rhs_axis_metadata_wrapper,
+        use_legacy_freezer=False,
         tiling_fn=tiling_fn
     )
     return aqt_dg_cls
 
-  def einsum(self):
+  def einsum(self, mesh_axes: Tuple[str, ...] = ()):
     """Returns einsum configured with aqt params."""
+    if self.quant_mode == aqt_flax.QuantMode.CONVERT:
+      # Sharding during convert leads to strange behavior when saving
+      # the quantized checkpoint.
+      rhs_axis_metadata_wrapper = None
+    else:
+      rhs_axis_metadata_wrapper = functools.partial(
+        _rhs_axis_metadata_wrapper, mesh_axes=mesh_axes, is_tiled=False
+      )
+
     aqt_einsum = functools.partial(
         aqt_flax.AqtEinsum(
             cfg=self.quant_dg,
             lhs_quant_mode=self.quant_mode,
             lhs_freeze_mode=aqt_flax.FreezerMode.NONE,
             rhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION_AND_VALUE,
+            rhs_axis_metadata_wrapper=rhs_axis_metadata_wrapper,
+            use_legacy_freezer=False,
         )
     )
     return aqt_einsum
@@ -177,6 +215,9 @@ def _get_quant_config(config):
         drhs_accumulator_dtype=drhs_accumulator_dtype,
     )
     """
+  elif config.quantization == "int4":
+    # Weight-only for the whole network.
+    return aqt_config.dot_general_make(lhs_bits=None, rhs_bits=4)
   elif config.quantization == "fp8":
     return "fp8"
   else:
@@ -308,20 +349,3 @@ def unquantize_kv(value: Array, scale: Array, dtype: jnp.dtype):
 
   return qt.dequant()
 """
-
-def update_aqt_annotations(config, state_logical_annotations):
-  mlp_weight_in_spec = PartitionSpec('embed', 'mlp')
-  mlp_weight_out_spec = PartitionSpec('mlp', 'embed')
-  attention_weight_qkv_spec = PartitionSpec('embed', 'heads', 'kv')
-  attention_weight_out_spec = PartitionSpec('heads', 'kv', 'embed')
-  num_layers = config.base_num_decoder_layers
-  # TBD - sharding for the scale.
-  for i in range(num_layers):
-    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['mlp']['wi_0']['AqtDotGeneral_0']['qrhs']['value'] = mlp_weight_in_spec
-    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['mlp']['wi_1']['AqtDotGeneral_0']['qrhs']['value'] = mlp_weight_in_spec
-    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['mlp']['wo']['AqtDotGeneral_0']['qrhs']['value'] = mlp_weight_out_spec
-    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['self_attention']['query']['AqtDotGeneral_0']['qrhs']['value'] = attention_weight_qkv_spec
-    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['self_attention']['key']['AqtDotGeneral_0']['qrhs']['value'] = attention_weight_qkv_spec
-    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['self_attention']['value']['AqtDotGeneral_0']['qrhs']['value'] = attention_weight_qkv_spec
-    state_logical_annotations.params['aqt']['decoder'][f'layers_{i}']['self_attention']['out']['AqtDotGeneral_0']['qrhs']['value'] = attention_weight_qkv_spec
-  return state_logical_annotations

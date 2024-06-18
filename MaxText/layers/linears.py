@@ -105,7 +105,8 @@ class DenseGeneral(nn.Module):
       """Computes a dot_general operation that may be quantized."""
       dot_general = lax.dot_general
       if self.quant:
-        dot_general_cls = self.quant.dot_general_cls()
+        # HERE The dot_general_cls is being created.
+        dot_general_cls = self.quant.dot_general_cls(mesh_axes=self.kernel_axes)
         dot_general = dot_general_cls()
       return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
 
