@@ -16,30 +16,37 @@
 
 import functools
 import json
+from typing import Optional
 
 from aqt.jax.v2 import aqt_tensor
 from aqt.jax.v2 import config as aqt_config
 from aqt.jax.v2 import tiled_dot_general
 from aqt.jax.v2.flax import aqt_flax
-from common_types import Array, Config
+import common_types
 from dataclasses import dataclass
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import re
 from jax.tree_util import tree_flatten_with_path, tree_unflatten
-from jax.sharding import PartitionSpec
 from typing import Tuple, Sequence
 
 MAX_INT8 = 127.5
 MAX_INT4 = 7.5
+
+Array = common_types.Array
+Config = common_types.Config
+AxisIdxes = common_types.AxisIdxes
+AxisNames = common_types.AxisNames
+CACHE_HEADS = common_types.CACHE_HEADS
+CACHE_KV = common_types.CACHE_KV
 
 
 @dataclass
 class Quantization:
   """Base class for quantization configurations"""
 
-  def dot_general_cls(self):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
     """Placeholder for dot_general implementation in subclasses."""
     pass
 
@@ -81,8 +88,6 @@ def _rhs_axis_metadata_wrapper(x: jnp.ndarray, tile_map, no_sharding_axis: Seque
     for no_shard_idx in no_sharding_axis:
       mesh_axes[no_shard_idx] = None
       
-  return nn.with_logical_partitioning((lambda: x), mesh_axes)()   
-
 
 @dataclass
 class AqtQuantization:
@@ -159,7 +164,7 @@ class Fp8Quantization(Quantization):
 
   quant_mode = "train"
 
-  def dot_general_cls(self):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
     """Returns dot_general configured with aqt params."""
     return nn.Fp8DotGeneralOp
 
@@ -302,9 +307,16 @@ def get_kvcache_dtype(quantize_kvcache: str):
   raise f"Unknown KVCache Quantization Option: {quantize_kvcache}. Should be either 'int8', 'int4' or ''."
 
 
-def quantize_kv(kv: Array, quantize_kvcache: str):
+def quantize_kv(kv: Array, kv_quant_axis: str, axis_names: AxisNames, quantize_kvcache: str):
   """Quantize key/values stored in kvcache."""
-  scale = jnp.max(jnp.abs(kv), axis=-1, keepdims=True)
+  if kv_quant_axis == "dkv":
+    max_axis_over = axis_names.index(CACHE_KV)
+  elif kv_quant_axis == "heads_and_dkv":
+    max_axis_over = (
+      axis_names.index(CACHE_HEADS),
+      axis_names.index(CACHE_KV)
+    )
+  scale = jnp.max(jnp.abs(kv), axis=max_axis_over, keepdims=True)
   if quantize_kvcache == "int8":
     value = jnp.int8(jnp.rint(kv * (MAX_INT8 / scale)))
   elif quantize_kvcache == "int4":
@@ -312,7 +324,6 @@ def quantize_kv(kv: Array, quantize_kvcache: str):
     value = jnp.int4(jnp.rint(kv * (MAX_INT4 / scale)))
   else:
     raise f"Unknown KVCache Quantization Option: {quantize_kvcache}. Should be either 'int8', 'int4' or ''."
-
   return value, scale
 
 def unquantize_kv(value: Array, scale: Array, dtype: jnp.dtype):

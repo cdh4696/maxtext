@@ -29,6 +29,7 @@ import max_logging
 import max_utils
 from multihost_dataloading import MultiHostDataLoadIterator
 from flax.training import train_state
+from flax.training import orbax_utils
 
 
 def create_orbax_checkpoint_manager(
@@ -36,7 +37,7 @@ def create_orbax_checkpoint_manager(
     enable_checkpointing: bool,
     use_async: bool,
     save_interval_steps: int,
-    dataset_type: Optional[str] = "c4",
+    dataset_type: Optional[str] = "tfds",
     orbax_logger: Optional[abstract_logger.AbstractLogger] = None,
 ):
   """Returns specified Orbax (async or not) CheckpointManager or None if checkpointing is disabled."""
@@ -46,7 +47,7 @@ def create_orbax_checkpoint_manager(
   max_logging.log("Creating checkpoint manager...")
   p = epath.Path(checkpoint_dir)
 
-  if dataset_type == "c4-array_record":
+  if dataset_type == "grain":
     item_names = ("items", "iter")
   else:
     item_names = ("items",)
@@ -92,13 +93,13 @@ def _replica_devices(device_array: np.ndarray, replica_axis_idx: int):
 
 
 def load_state_if_possible(
-    checkpoint_manager: CheckpointManager,
+    checkpoint_manager: Union[CheckpointManager, None],
     data_iterator: Union[MultiHostDataLoadIterator, None],
     load_parameters_from_path: str,
     load_full_state_from_path: str,
     abstract_unboxed_pre_state: train_state.TrainState,
     enable_single_replica_ckpt_restoring: Optional[bool] = False,
-    dataset_type: Optional[str] = "c4",
+    dataset_type: Optional[str] = "tfds",
 ):
   """Loads TrainState as possible from the inputs.
 
@@ -158,7 +159,7 @@ def load_state_if_possible(
           map_to_pspec,
           abstract_unboxed_pre_state,
       )
-      if dataset_type == "c4-array_record" and data_iterator is not None:
+      if dataset_type == "grain" and data_iterator is not None:
         return (
             checkpoint_manager.restore(
                 latest_step,
@@ -181,23 +182,8 @@ def load_state_if_possible(
         )
 
   if load_parameters_from_path != "":
-    max_logging.log(f"restoring params from {load_parameters_from_path=}")
-    p = epath.Path(load_parameters_from_path)
-    ckptr = orbax.checkpoint.PyTreeCheckpointer()
-    # This is a memory optimization. We don't want to restore the entire checkpoint - only the params.
-    # Rather than pass the entire abstract state, which could unnecessarily restore opt_state and such and waste
-    # memory, we instead specify here that we are just restoring the params field of the checkpoint
-    # (which itself may be a dictionary containing a key named 'params').
-    restore_args = orbax.checkpoint.checkpoint_utils.construct_restore_args(abstract_unboxed_pre_state.params)
-
-    print("\n Before loading params\n")
-    max_utils.print_mem_stats()
-    restored = ckptr.restore(
-        p, item={"params": abstract_unboxed_pre_state.params}, transforms={}, restore_args={"params": restore_args}
-    )
-    print("\n After loading params\n")
-    max_utils.print_mem_stats()
-    return None, restored["params"]
+    restored_params = load_params_from_path(load_parameters_from_path, abstract_unboxed_pre_state.params)
+    return None, restored_params
 
   elif load_full_state_from_path != "":
     max_logging.log(f"restoring full state from {load_full_state_from_path=}")
@@ -227,17 +213,52 @@ def setup_checkpoint_logger(config) -> composite_logger.CompositeLogger | None:
         job_name=config.run_name, logger_name=logger_name
     )
     orbax_cloud_logger = cloud_logger.CloudLogger(options=options)
-    max_logging.log("Sucessfully set up checkpoint cloud logger.")
+    max_logging.log("Successfully set up checkpoint cloud logger.")
 
   if config.enable_checkpoint_standard_logger:
     orbax_standard_logger = standard_logger.StandardLogger()
-    max_logging.log("Sucessfully set up checkpoint standard logger.")
+    max_logging.log("Successfully set up checkpoint standard logger.")
 
   orbax_logger = None
   if orbax_cloud_logger is not None and orbax_standard_logger is not None:
     orbax_logger = composite_logger.CompositeLogger(
         orbax_cloud_logger, orbax_standard_logger
     )
-    max_logging.log("Sucessfully set up checkpoint composite logger.")
+    max_logging.log("Successfully set up checkpoint composite logger.")
 
   return orbax_logger
+
+
+def load_params_from_path(load_parameters_from_path, abstract_unboxed_params):
+  """Load decode params from checkpoint at specified path."""
+  assert load_parameters_from_path, "load_parameters_from_path is not defined."
+  max_logging.log(f"restoring params from {load_parameters_from_path}")
+  ckpt = epath.Path(load_parameters_from_path)
+  ckptr = orbax.checkpoint.PyTreeCheckpointer()
+  # This is a memory optimization. We don't want to restore the entire checkpoint - only the params.
+  # Rather than pass the entire abstract state, which could unnecessarily restore opt_state and such and waste
+  # memory, we instead specify here that we are just restoring the params field of the checkpoint
+  # (which itself may be a dictionary containing a key named 'params').
+  restore_args = orbax.checkpoint.checkpoint_utils.construct_restore_args(abstract_unboxed_params)
+  restored = ckptr.restore(
+    ckpt,
+    item={"params": abstract_unboxed_params},
+    transforms={},
+    restore_args={"params": restore_args}
+    )
+  return restored["params"]
+
+
+def save_params_to_path(checkpoint_dir, params):
+  """Save decode params in checkpoint at specified path."""
+  assert checkpoint_dir, "checkpoint_dir is not defined."
+  orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+  save_args = orbax_utils.save_args_from_target({"params":params})
+  orbax_checkpointer.save(
+    checkpoint_dir,
+    {"params":params},
+    save_args=save_args,
+    force=True
+    )
+  print(f"Quantized params checkpoint saved at: {checkpoint_dir}")
+

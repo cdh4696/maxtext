@@ -30,6 +30,8 @@ from jax.sharding import PartitionSpec as P
 import common_types
 from jetstream.engine import engine_api
 from jetstream.engine import tokenizer_pb2
+from jetstream.engine import tokenizer_api
+from jetstream.engine import token_utils
 
 import max_utils
 import inference_utils
@@ -82,11 +84,11 @@ class MaxEngine(engine_api.Engine):
     """Load Parameters, typically from GCS"""
     # pylint: disable=unused-argument
 
-    if self.config.load_from_quantized_checkpoint:
+    if self.model.quant and self.config.checkpoint_is_quantized:
       print("Loading from the quantized checkpoint...")
       self.model.quant.quant_mode = quantizations.get_quant_mode("serve")
 
-    state, self.state_mesh_annotations = max_utils.setup_decode_state(self.model, self.config, self.rng, self._mesh, None)
+    state, self.state_mesh_annotations = max_utils.setup_decode_state(self.model, self.config, self.rng, self._mesh)
     self.abstract_params = jax.tree_util.tree_map(
         lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), state.params
     )
@@ -94,49 +96,40 @@ class MaxEngine(engine_api.Engine):
     self.kv_cache_shardings = jax.tree_util.tree_map(
       lambda x: jax.sharding.NamedSharding(self._mesh, x), self.kv_cache_annotations)
 
-    if not self.model.quant or self.config.load_from_quantized_checkpoint:
-      self.abstract_params = jax.tree_util.tree_map(
-          lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), state.params
-      )
-      return state.params
+    if self.model.quant and not self.config.checkpoint_is_quantized:
+      params = self.quantize_params(state)
     else:
-      self.model.quant.quant_mode = quantizations.get_quant_mode("convert")
+      params = state.params
+    max_utils.print_mem_stats('After load_params')
+    return params
 
-      @jax.jit
-      def model_apply(_p, _rng):
-        return self.model.apply(
-            _p | {"aqt": {}},
-            jnp.ones((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
-            jnp.ones((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
-            decoder_segment_ids=jnp.zeros((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
-            enable_dropout=False,
-            model_mode=common_types.MODEL_MODE_PREFILL,
-            rngs={"params": _rng},
-            mutable=True,
+  def quantize_params(self, state):
+    """Forward pass to quantize decode params."""
+    self.model.quant.quant_mode = quantizations.get_quant_mode("convert")
+    @jax.jit
+    def model_apply(_p, _rng):
+      return self.model.apply(
+        _p | {"aqt": {}},
+        jnp.ones((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
+        jnp.ones((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
+        decoder_segment_ids=jnp.zeros((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
+        enable_dropout=False,
+        model_mode=common_types.MODEL_MODE_PREFILL,
+        rngs={"params": _rng},
+        mutable=True,
         )
-      _, new_vars = model_apply(state.params, self.rng)
 
-      params = {}
-      params["aqt"] = new_vars["aqt"]
-      # Remove param values which have corresponding qtensors in aqt to save memory.
-      params["params"] = quantizations.remove_quantized_params(state.params["params"], new_vars["aqt"])
-
-      self.abstract_params = jax.tree_util.tree_map(
-          lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), params
+    _, new_vars = model_apply(state.params, self.rng)
+    # Remove param values which have corresponding qtensors in aqt to save memory.
+    params = {}
+    params["aqt"] = new_vars["aqt"]
+    params["params"] = quantizations.remove_quantized_params(state.params["params"], new_vars["aqt"])
+    self.abstract_params = jax.tree_util.tree_map(
+      lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), params
       )
-      # TBD(msingh) - fix sharding for aqt here as well
-
-      # Save the quantized checkpoint, if necessary.
-      if self.config.save_quantized_checkpoint:
-        orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        save_args = orbax_utils.save_args_from_target({"params":params})
-        orbax_checkpointer.save(
-            self.config.save_quantized_checkpoint, {"params":params}, save_args=save_args, force=True
-        )
-        print("QUANTIZED CHECKPOINT SAVED AT: ", self.config.save_quantized_checkpoint)
-
-      self.model.quant.quant_mode = quantizations.get_quant_mode("serve")
-      return params
+    max_utils.save_quantized_checkpoint_if_configured(self.config, params)
+    self.model.quant.quant_mode = quantizations.get_quant_mode("serve")
+    return params
 
   @functools.partial(jax.jit, static_argnums=(0,))
   def prefill(
@@ -268,7 +261,12 @@ class MaxEngine(engine_api.Engine):
       if path_key in ["cache_ar_index", "cached_ar_key", "cached_ar_value", "cached_ar_key_scale", "cached_ar_value_scale"]:
         return full_cache  # we don't even zero these out because we can mask them out.
 
-      batch_idx = annotations.index("cache_batch") if "cache_batch" in annotations else -1
+      batch_idx = -1
+      if "cache_batch" in annotations:
+        batch_idx = annotations.index("cache_batch")
+      elif "cache_scale_batch" in annotations:
+        batch_idx = annotations.index("cache_scale_batch")
+
       if batch_idx < 0:
         raise ValueError(f"Batch index {batch_idx=} shouldn't be less than zero for {path_key}, got {annotations=}")
 
@@ -324,6 +322,13 @@ class MaxEngine(engine_api.Engine):
   def get_tokenizer(self) -> tokenizer_pb2.TokenizerParameters:
     """Return a protobuf of tokenizer info, callable from Py or C++."""
     return tokenizer_pb2.TokenizerParameters(path=self.config.tokenizer_path, extra_ids=0)
+
+  def build_tokenizer(self, metadata: tokenizer_pb2.TokenizerParameters) -> tokenizer_api.Tokenizer:
+    """Return a tokenizer"""
+    if "tiktoken" in metadata.path:
+      return token_utils.TikToken(metadata)
+    else:
+      return token_utils.SentencePieceTokenizer(metadata)
 
   def init_decode_state(self, *args, **kwargs) -> DecodeState:
     """Initialises any state which a generation step transforms."""
