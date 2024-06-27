@@ -66,8 +66,9 @@ def _tiling_fn(lhs, rhs, dimension_numbers, tile_size):
   return ret
 
 
-def _rhs_axis_metadata_wrapper(x: jnp.ndarray, no_sharding_axis: Sequence[int], mesh_axes: Tuple[str, ...], is_tiled: bool):
+def _rhs_axis_metadata_wrapper(x: jnp.ndarray, tile_map, no_sharding_axis: Sequence[int], mesh_axes: Tuple[str, ...], is_tiled: bool):
   mesh_axes = list(mesh_axes)
+  del tile_map
   if is_tiled:
     # The original rank of x will be doubled, e.x. [a, b, c] --> [_, a', _, b', _, c'].
     # The mesh axes should be doubled too.
