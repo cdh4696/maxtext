@@ -426,7 +426,7 @@ class AttentionOp(nn.Module):
     return tuple([items[i] for i in axis_order])
 
   def _get_prefill_cache_vars(self, batch, heads, kv_head_size):
-    dtype = quantizations.get_kvcache_dtype(quantize_kvcache)
+    dtype = quantizations.get_kvcache_dtype(self.quantize_kvcache)
     cache_logical_shape = (batch, self.max_prefill_predict_length, heads, kv_head_size)
 
     cache_axis_names = self.transpose_tuple(self.cache_logical_axis_names, self.prefill_cache_axis_order)
@@ -487,7 +487,7 @@ class AttentionOp(nn.Module):
     return key_vars, value_vars, cached_segment_id_var
 
   def _get_ar_cache_vars(self, batch, heads, kv_head_size):
-    dtype = quantizations.get_kvcache_dtype(quantize_kvcache)
+    dtype = quantizations.get_kvcache_dtype(self.quantize_kvcache)
     cache_length = self.max_target_length - self.max_prefill_predict_length
     cache_logical_shape = (batch, cache_length, heads, kv_head_size)
 
@@ -593,7 +593,7 @@ class AttentionOp(nn.Module):
       key_shaped_for_cache, key_scale_shaped_for_cache = quantizations.quantize_kv(
         key_shaped_for_cache, self.kv_quant_axis, prefill_key_axis_names, self.quantize_kvcache)
       value_shaped_for_cache, value_scale_shaped_for_cache = quantizations.quantize_kv(
-        value_shaped_for_cache, self.kv_quant_axis, prefill_key_axis_names, self.quantize_kv)
+        value_shaped_for_cache, self.kv_quant_axis, prefill_key_axis_names, self.quantize_kvcache)
       cached_prefill_key_vars[1].value = key_scale_shaped_for_cache
       cached_prefill_value_vars[1].value = value_scale_shaped_for_cache
 

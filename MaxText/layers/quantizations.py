@@ -75,18 +75,22 @@ def _tiling_fn(lhs, rhs, dimension_numbers, tile_size):
 
 def _rhs_axis_metadata_wrapper(x: jnp.ndarray, tile_map, no_sharding_axis: Sequence[int], mesh_axes: Tuple[str, ...], is_tiled: bool):
   mesh_axes = list(mesh_axes)
-  del tile_map
   if is_tiled:
-    # The original rank of x will be doubled, e.x. [a, b, c] --> [_, a', _, b', _, c'].
-    # The mesh axes should be doubled too.
-    assert len(x.shape) >= 2 * len(mesh_axes)
-    mesh_axes = [None] * (len(x.shape) - 2 * len(mesh_axes)) + sum(
-        ([None, axis] for axis in mesh_axes), []
-    )
+    # tile_map is a mapping between original rank and a list of new, tiled rank.
+    if len(mesh_axes) < len(tile_map):
+      mesh_axes = [None] * (len(tile_map) - len(mesh_axes)) + mesh_axes
+    new_mesh_axes = [None] * len(x.shape)
+    for orig_rank, new_rank in tile_map.items():
+      assert new_rank
+      assert len(new_rank) <= 2
+      new_mesh_axes[new_rank[-1]] = mesh_axes[orig_rank]
+    mesh_axes = new_mesh_axes
           
   if mesh_axes is not None and len(mesh_axes) > 0:
     for no_shard_idx in no_sharding_axis:
       mesh_axes[no_shard_idx] = None
+
+  return nn.with_logical_partitioning((lambda: x), mesh_axes)()
       
 
 @dataclass
@@ -186,7 +190,10 @@ def _get_quant_config(config):
       for layer_name_re, layer_quantization_config in mixed_precision_config.items():
         rhs_num_bits = layer_quantization_config.get("bits", 8)
         tile_size = layer_quantization_config.get("tile_size", -1)
+        scale = layer_quantization_config.get("scale", 1.0)
         ret_config[layer_name_re] = [aqt_config.dot_general_make(lhs_bits=None, rhs_bits=rhs_num_bits), tile_size]
+        if scale < 1.0:
+          aqt_dg.fwd.dg_quantizer.rhs.calibration = functools.partial(calibration.AbsMaxCalibration, scale=scale)
 
       ret_config["default"] = [aqt_config.dot_general_make(lhs_bits=None, rhs_bits=8), -1]
       return ret_config
