@@ -21,6 +21,7 @@ from typing import Optional
 from aqt.jax.v2 import aqt_tensor
 from aqt.jax.v2 import config as aqt_config
 from aqt.jax.v2 import tiled_dot_general
+from aqt.jax.v2 import calibration
 from aqt.jax.v2.flax import aqt_flax
 import common_types
 from dataclasses import dataclass
@@ -191,9 +192,11 @@ def _get_quant_config(config):
         rhs_num_bits = layer_quantization_config.get("bits", 8)
         tile_size = layer_quantization_config.get("tile_size", -1)
         scale = layer_quantization_config.get("scale", 1.0)
-        ret_config[layer_name_re] = [aqt_config.dot_general_make(lhs_bits=None, rhs_bits=rhs_num_bits), tile_size]
+        aqt_dg = aqt_config.dot_general_make(lhs_bits=None, rhs_bits=rhs_num_bits)
         if scale < 1.0:
           aqt_dg.fwd.dg_quantizer.rhs.calibration = functools.partial(calibration.AbsMaxCalibration, scale=scale)
+
+        ret_config[layer_name_re] = [aqt_dg, tile_size]
 
       ret_config["default"] = [aqt_config.dot_general_make(lhs_bits=None, rhs_bits=8), -1]
       return ret_config
