@@ -183,37 +183,8 @@ class Decoder(nn.Module):
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block=}")
 
-  @nn.compact
-  def __call__(
-      self,
-      decoder_input_tokens,
-      decoder_positions,
-      decoder_segment_ids=None,
-      deterministic=False,
-      model_mode=common_types.MODEL_MODE_TRAIN,
-  ):
+  def _setup_block_layer(self):
     cfg = self.config
-    mesh = self.mesh
-    assert decoder_input_tokens.ndim == 2  # [batch, len]
-
-    # [batch, length] -> [batch, length, emb_dim]
-    y = self.shared_embedding(decoder_input_tokens.astype("int32"))
-    y = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(y, deterministic=deterministic)
-    y = y.astype(cfg.dtype)
-
-    if cfg.use_untrainable_positional_embedding:
-      y = PositionalEmbedding(cfg.base_emb_dim)(y, decoder_positions)
-
-    if cfg.trainable_position_size > 0:
-      y += Embed(
-          num_embeddings=cfg.trainable_position_size,
-          features=cfg.emb_dim,
-          dtype=cfg.dtype,
-          embedding_init=nn.initializers.normal(stddev=1.0),
-          name="position_embedder",
-          config=cfg,
-      )(decoder_positions)
-
     BlockLayer = self.get_decoder_layer()
 
     if cfg.remat_policy != "none":
@@ -268,7 +239,58 @@ class Decoder(nn.Module):
           policy=policy,
           static_argnums=(-1, -2, -3, -4, -5),
       )
+    return BlockLayer
+
+  def _apply_embedding(self, decoder_input_tokens, decoder_positions, deterministic):
+    cfg = self.config
+
+    # [batch, length] -> [batch, length, emb_dim]
+    y = self.shared_embedding(decoder_input_tokens.astype("int32"))
+    y = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(y, deterministic=deterministic)
+    y = y.astype(cfg.dtype)
+
+    if cfg.use_untrainable_positional_embedding:
+      y = PositionalEmbedding(cfg.base_emb_dim)(y, decoder_positions)
+
+    if cfg.trainable_position_size > 0:
+      y += Embed(
+          num_embeddings=cfg.trainable_position_size,
+          features=cfg.emb_dim,
+          dtype=cfg.dtype,
+          embedding_init=nn.initializers.normal(stddev=1.0),
+          name="position_embedder",
+          config=cfg,
+      )(decoder_positions)
+
+    return y
+
+  @nn.compact
+  def __call__(
+      self,
+      decoder_input_tokens,
+      decoder_positions,
+      decoder_segment_ids=None,
+      deterministic=False,
+      model_mode=common_types.MODEL_MODE_TRAIN,
+      partial_execution: bool = False,
+      start_decode_layer: int = -1,
+      end_decode_layer: int = -1,
+      previous_decode_output = None
+  ):
+    cfg = self.config
+    mesh = self.mesh
+    BlockLayer = self._setup_block_layer()
+
+    assert decoder_input_tokens.ndim == 2  # [batch, len]
+
+    if not partial_execution or start_decode_layer <= 0:
+      y = self._apply_embedding(decoder_input_tokens, decoder_positions, deterministic)
+    else:
+      assert previous_decode_output is not None
+      y = previous_decode_output
+    
     if cfg.scan_layers:
+      assert not partial_execution, "Decode partial execution not supported when scan_layer is set"
       initializing = self.is_mutable_collection("params")
       params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
       cache_spec = 0
@@ -301,7 +323,15 @@ class Decoder(nn.Module):
           model_mode,
       )
     else:
-      for lyr in range(cfg.num_decoder_layers):
+      if partial_execution:
+        assert end_decode_layer > start_decode_layer
+        assert start_decode_layer >= 0
+        assert end_decode_layer <= cfg.num_decoder_layers
+        execution_layers = range(start_decode_layer, end_decode_layer)
+      else:
+        execution_layers = range(cfg.num_decoder_layers)
+
+      for lyr in execution_layers:
         y = BlockLayer(config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant)(
             y,
             decoder_segment_ids,
@@ -309,6 +339,9 @@ class Decoder(nn.Module):
             deterministic,
             model_mode,
         )
+
+    if partial_execution and end_decode_layer < cfg.num_decoder_layers:
+      return y
 
     y = self.get_norm_layer()(
         dtype=cfg.dtype,
@@ -374,6 +407,10 @@ class Transformer(nn.Module):
       decoder_segment_ids=None,
       enable_dropout=True,
       model_mode=common_types.MODEL_MODE_TRAIN,
+      partial_execution: bool = False,
+      start_decode_layer: int = -1,
+      end_decode_layer: int = -1,
+      previous_decode_output = None
   ):
     """Applies Transformer decoder-branch on encoded-input and target."""
 
@@ -389,5 +426,9 @@ class Transformer(nn.Module):
         decoder_segment_ids=decoder_segment_ids,
         deterministic=not enable_dropout,
         model_mode=model_mode,
+        partial_execution=partial_execution,
+        start_decode_layer=start_decode_layer,
+        end_decode_layer=end_decode_layer,
+        previous_decode_output=previous_decode_output
     )
     return logits

@@ -20,6 +20,9 @@ import json
 from aqt.jax.v2 import aqt_tensor
 from aqt.jax.v2 import config as aqt_config
 from aqt.jax.v2 import tiled_dot_general
+from aqt.jax.v2 import aqt_quantizer
+from aqt.jax.v2 import calibration
+from aqt.jax.v2.extensions.gptq import gptq_dot_general_quantizer
 from aqt.jax.v2.flax import aqt_flax
 from common_types import Array, Config
 from dataclasses import dataclass
@@ -66,21 +69,24 @@ def _tiling_fn(lhs, rhs, dimension_numbers, tile_size):
   return ret
 
 
-def _rhs_axis_metadata_wrapper(x: jnp.ndarray, no_sharding_axis: Sequence[int], mesh_axes: Tuple[str, ...], is_tiled: bool):
+def _rhs_axis_metadata_wrapper(x: jnp.ndarray, tile_map, no_sharding_axis: Sequence[int], mesh_axes: Tuple[str, ...], is_tiled: bool):
   mesh_axes = list(mesh_axes)
   if is_tiled:
-    # The original rank of x will be doubled, e.x. [a, b, c] --> [_, a', _, b', _, c'].
-    # The mesh axes should be doubled too.
-    assert len(x.shape) >= 2 * len(mesh_axes)
-    mesh_axes = [None] * (len(x.shape) - 2 * len(mesh_axes)) + sum(
-        ([None, axis] for axis in mesh_axes), []
-    )
+    # tile_map is a mapping between original rank and a list of new, tiled rank.
+    if len(mesh_axes) < len(tile_map):
+      mesh_axes = [None] * (len(tile_map) - len(mesh_axes)) + mesh_axes
+    new_mesh_axes = [None] * len(x.shape)
+    for orig_rank, new_rank in tile_map.items():
+      assert new_rank
+      assert len(new_rank) <= 2
+      new_mesh_axes[new_rank[-1]] = mesh_axes[orig_rank]
+    mesh_axes = new_mesh_axes
           
   if mesh_axes is not None and len(mesh_axes) > 0:
     for no_shard_idx in no_sharding_axis:
       mesh_axes[no_shard_idx] = None
-      
-  return nn.with_logical_partitioning((lambda: x), mesh_axes)()   
+
+  return nn.with_logical_partitioning((lambda: x), mesh_axes)()
 
 
 @dataclass
@@ -180,7 +186,31 @@ def _get_quant_config(config):
       for layer_name_re, layer_quantization_config in mixed_precision_config.items():
         rhs_num_bits = layer_quantization_config.get("bits", 8)
         tile_size = layer_quantization_config.get("tile_size", -1)
-        ret_config[layer_name_re] = [aqt_config.dot_general_make(lhs_bits=None, rhs_bits=rhs_num_bits), tile_size]
+        scale = layer_quantization_config.get("scale", 1.0)
+        algorithm = layer_quantization_config.get("algorithm", None)
+        other_input = layer_quantization_config.get("other_input", False)
+
+        aqt_dg = aqt_config.dot_general_make(lhs_bits=None, rhs_bits=rhs_num_bits)
+        if algorithm == "gptq":
+          lhs = aqt_quantizer.quantizer_make(None, initialize_calibration=False)
+          rhs = aqt_quantizer.quantizer_make(rhs_num_bits, initialize_calibration=False)
+
+          gptq_dg_quantizer = gptq_dot_general_quantizer.GptqDotGeneralQuantizer(
+              lhs=lhs, rhs=rhs, sharding_axes=None, quant_collection='aqt_calibration'
+          )
+          aqt_dg.fwd.dg_quantizer = gptq_dg_quantizer
+        
+        if scale < 1.0:
+          # We need some assertions here.
+          print("++++++++ SETTING AbsMaxCalibration Scale ++++++", scale)
+          aqt_dg.fwd.dg_quantizer.rhs.calibration = functools.partial(calibration.AbsMaxCalibration, scale=scale)
+        
+        if other_input:
+          aqt_dg.fwd.rhs.dequant_mode = aqt_config.DequantMode.OTHER_INPUT
+          aqt_dg.fwd.rhs.calibration_mode = aqt_config.CalibrationMode.REMAINING_AXIS
+          aqt_dg.dlhs.rhs.use_fwd_quant = False
+
+        ret_config[layer_name_re] = [aqt_dg, tile_size]
 
       ret_config["default"] = [aqt_config.dot_general_make(lhs_bits=None, rhs_bits=8), -1]
       return ret_config
@@ -236,6 +266,8 @@ def get_quant_mode(quant_mode_str: str = "train"):
   """Set quant mode."""
   if quant_mode_str == "train":
     return aqt_flax.QuantMode.TRAIN
+  elif quant_mode_str == "calibrate":
+    return aqt_flax.QuantMode.CALIBRATE
   elif quant_mode_str == "serve":
     return aqt_flax.QuantMode.SERVE
   elif quant_mode_str == "convert":

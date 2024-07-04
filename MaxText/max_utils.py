@@ -382,6 +382,8 @@ def init_initial_state(model, tx, config, is_training, key):
       jnp.ones(input_shape, dtype=jnp.int32),
       jnp.ones(input_shape, dtype=jnp.int32),
   )
+  print("+++++++++++++++++++++++ MODEL_VARS ++++++++++++++")
+  print(model_vars)
   if is_training:
     return init_training_state(model.apply, model_vars, tx)
   return init_decode_state(model.apply, model_vars)

@@ -14,6 +14,7 @@
 
 """Implementation of Engine API for MaxText"""
 import functools
+import time
 from typing import Any, Optional, Tuple
 
 import flax
@@ -77,6 +78,160 @@ class MaxEngine(engine_api.Engine):
     self.kv_cache_shardings = None
     self.state_mesh_annotations = None
 
+  def _filter_out_layerwise_parameters(self, params, start_layer_idx, end_layer_idx):
+    ret_params = dict()
+    for collection, param in params.items():
+      ret_params[collection] = dict()
+      for param_key, param_values in param.items():
+        if param_key == "decoder":
+          ret_params[collection][param_key] = dict()
+          for layer_idx in range(start_layer_idx, end_layer_idx):
+            ret_params[collection][param_key][f'layers_{layer_idx}'] = param_values[f'layers_{layer_idx}']
+          if start_layer_idx == 0 or end_layer_idx == self.config.num_decoder_layers:
+            for sublayer_name, sublayer_value in param_values.items():
+              if sublayer_name[:7] == "layers_" and sublayer_name[7:].isdigit():
+                continue
+              ret_params[collection][param_key][sublayer_name] = sublayer_value
+        else:
+          if start_layer_idx == 0 or end_layer_idx == self.config.num_decoder_layers:
+            ret_params[collection][param_key] = param_values
+    
+    return ret_params
+
+  def _integrate_parameters(self, source, target):
+    """Integrate source pytree into target."""
+    for k, v in source.items():
+      if k not in target:
+        target[k] = v
+      else:
+        if not isinstance(v, jax.Array):
+          target[k] = self._integrate_parameters(v, target[k])
+
+    return target
+
+  def execute_layerwise_calibration(
+      self,
+      params,
+      input_token_batches: list[jax.Array],  # A list of BS X Seq.
+      true_length_batches: list[list[int]],
+  ) -> Params:
+    """Executes layerwise calibration."""
+    # Only using the prefill, Layerwise execution.
+    assert len(input_token_batches) == len(true_length_batches), f"{len(input_token_batches)} vs. {len(true_length_batches)}"
+    
+    @functools.partial(jax.jit, static_argnums=(6, 7,))
+    def model_apply_layerwise(params, rng, input_tokens, positions, decoder_segment_ids, prev_y, start_layer_idx, end_layer_idx):
+      return self.model.apply(
+          params,
+          input_tokens,
+          positions,
+          decoder_segment_ids=decoder_segment_ids,
+          enable_dropout=False,
+          model_mode=common_types.MODEL_MODE_PREFILL,
+          rngs={"params": rng},
+          mutable=True,
+          partial_execution=True,
+          start_decode_layer=start_layer_idx,
+          end_decode_layer=end_layer_idx,
+          previous_decode_output=prev_y
+      )
+
+    # For each decoding layer, do the calibration & quantization.
+    # If you do not want to hold the whole float checkpoint during calibration,
+    # You can do so by frequently reloading the whole model.
+    start_calibration_time = time.time()
+    dummy_input_tokens = jnp.ones((1, self.config.max_prefill_predict_length), dtype=jnp.int32)
+    dummy_positions = jnp.ones((1, self.config.max_prefill_predict_length), dtype=jnp.int32)
+    dummy_decoder_segment_ids = jnp.zeros((1, self.config.max_prefill_predict_length), dtype=jnp.int32)
+    dummy_prev_y = None
+    prev_ys = [None] * len(input_token_batches)
+    quantized_params = dict()
+    for start_layer_idx in range(self.config.num_decoder_layers):
+      print(f"\n**************************** LAYERWISE QUANTIZATION FOR: {start_layer_idx} / {self.config.num_decoder_layers - 1}")
+      start_layer_time = time.time()
+      end_layer_idx = start_layer_idx + 1
+      layerwise_params = self._filter_out_layerwise_parameters(params, start_layer_idx, end_layer_idx)
+     
+      if prev_ys[0] is not None and dummy_prev_y is None:
+        prev_y_shape = list(prev_ys[0].shape)
+        prev_y_shape[0] = 1
+        dummy_prev_y = jnp.ones(prev_y_shape, dtype=prev_ys[0].dtype)
+      
+      #########################
+      # Layerwise calibration #
+      #########################
+      # Initialize calibration params by running it once.          
+      self.model.quant.quant_mode = quantizations.get_quant_mode("calibrate")  
+      with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+        _, mutables = model_apply_layerwise(
+            layerwise_params, self.rng,
+            dummy_input_tokens, dummy_positions, dummy_decoder_segment_ids, dummy_prev_y,
+            start_layer_idx, end_layer_idx
+        )
+        layerwise_params["aqt_calibration"] = mutables["aqt_calibration"]
+
+      # Run for multiple calibration batches.
+      for input_tokens, true_lengths, prev_y in zip(input_token_batches, true_length_batches, prev_ys):
+        positions = jax.lax.broadcasted_iota(dtype=jax.numpy.int32, shape=input_tokens.shape, dimension=1)
+        ones_to_keep = positions < jnp.expand_dims(true_lengths, 1)
+        sequence_indicator = ones_to_keep * common_types.DECODING_ACTIVE_SEQUENCE_INDICATOR
+
+        with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+          _, mutables = model_apply_layerwise(
+              layerwise_params, self.rng,
+              input_tokens, positions, sequence_indicator, prev_y,
+              start_layer_idx, end_layer_idx
+          )
+          layerwise_params["aqt_calibration"] = mutables["aqt_calibration"]
+
+      print("=== MEM STATS AFTER CALIBRATION ===")
+      max_utils.print_mem_stats()
+      start_convert_time = time.time()
+      print(f"=== TIME FOR CALIBRATION: {start_convert_time - start_layer_time}")
+
+      #####################
+      # Layerwise convert #
+      #####################
+      self.model.quant.quant_mode = quantizations.get_quant_mode("convert")
+      with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+        _, new_vars = model_apply_layerwise(
+            layerwise_params, self.rng,
+            dummy_input_tokens, dummy_positions, dummy_decoder_segment_ids, dummy_prev_y,
+            start_layer_idx, end_layer_idx
+        )
+      quantized_layerwise_params = {}
+      quantized_layerwise_params["aqt"] = new_vars["aqt"]
+      quantized_layerwise_params["params"] = quantizations.remove_quantized_params(layerwise_params["params"], new_vars["aqt"])
+      self._integrate_parameters(quantized_layerwise_params, quantized_params)
+      print("=== MEM STATS AFTER MATERIALIZATION ===")
+      max_utils.print_mem_stats()      
+      start_collection_time = time.time()
+      print(f"=== TIME FOR CONVERT: {start_collection_time - start_convert_time}")
+
+      ######################################
+      # Collect inputs for the next layer. #
+      ######################################
+      new_ys = []
+      self.model.quant.quant_mode = quantizations.get_quant_mode("serve")
+      for input_tokens, true_lengths, prev_y in zip(input_token_batches, true_length_batches, prev_ys):
+        positions = jax.lax.broadcasted_iota(dtype=jax.numpy.int32, shape=input_tokens.shape, dimension=1)
+        ones_to_keep = positions < jnp.expand_dims(true_lengths, 1)
+        sequence_indicator = ones_to_keep * common_types.DECODING_ACTIVE_SEQUENCE_INDICATOR
+
+        with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+          new_y, _ = model_apply_layerwise(
+              quantized_layerwise_params, self.rng,
+              input_tokens, positions, sequence_indicator, prev_y,
+              start_layer_idx, end_layer_idx
+          )
+        new_ys.append(new_y)
+      prev_ys = new_ys
+      print(f"=== TIME FOR COLLECTION: {time.time() - start_collection_time}")
+      print(f"=== TIME FOR THE WHOLE LAYER: {time.time() - start_layer_time}")
+
+    print(f"=== WHOLE TIME TAKEN: {time.time() - start_calibration_time}")
+    return quantized_params
+
   # TBD (msingh): move quantization code to generate_param_only_checkpoint.py
   def load_params(self, *args, **kwargs) -> Params:
     """Load Parameters, typically from GCS"""
@@ -94,10 +249,7 @@ class MaxEngine(engine_api.Engine):
     self.kv_cache_shardings = jax.tree_util.tree_map(
       lambda x: jax.sharding.NamedSharding(self._mesh, x), self.kv_cache_annotations)
 
-    if not self.model.quant or self.config.load_from_quantized_checkpoint:
-      self.abstract_params = jax.tree_util.tree_map(
-          lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), state.params
-      )
+    if not self.model.quant or self.config.load_from_quantized_checkpoint or self.config.calibrate_dataset:
       return state.params
     else:
       self.model.quant.quant_mode = quantizations.get_quant_mode("convert")
