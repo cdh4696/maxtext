@@ -335,39 +335,3 @@ def quantize_kv(kv: Array, kv_quant_axis: str, axis_names: AxisNames, quantize_k
   else:
     raise f"Unknown KVCache Quantization Option: {quantize_kvcache}. Should be either 'int8', 'int4' or ''."
   return value, scale
-
-def unquantize_kv(value: Array, scale: Array, dtype: jnp.dtype):
-  """Unquantize key/values stored in kvcache."""
-  # I do not know what 'dtype' here means, but its value is quite unpredictable...
-  if value.dtype == jnp.int8:
-    return value.astype(dtype) * scale / MAX_INT8
-  elif value.dtype == jnp.int4:
-    # int4 must be explicitly casted to float before multiplication.
-    return value.astype(scale.dtype) * scale / MAX_INT4
-  
-  raise f"Bad quantized dtype: {value.dtype}"
-
-# Replacing the above code with QTensor *significantly* slows down the running speed - Sharding issue possibly.
-"""
-def quantize_kv(kv: Array, quantize_kvcache: str):
-  kvcache_dtype = get_kvcache_dtype(quantize_kvcache)
-  num_bits = 8 if kvcache_dtype == jnp.int8 else 4
-
-  # Only preserve max val for 8-bit quantization; for 4-bit quant, we want to
-  # use the Q=7.5 value specifically, hence preserve_max_val=False if k4v4.
-  quantizer = aqt_config.quantizer_make(num_bits,
-                                        preserve_max_val=num_bits == 8)
-  qt, _ = quantizer.quant(kv, calibration_axes=[-1])
-  assert len(qt.scale) == 1
-  qvalue_dtype = quantizer.numerics.get_dtype()
-  qt = qt.qvalue_astype(qvalue_dtype)
-
-  print("======= KVCache quantized to: ", qt.qvalue.dtype, quantize_kvcache)
-
-  return qt.qvalue, qt.scale[0]
-
-def unquantize_kv(value: Array, scale: Array, dtype: jnp.dtype):
-  qt = aqt_tensor.QTensor(qvalue=value, scale=[scale], scale_t=None, dequant_dtype=dtype)
-
-  return qt.dequant()
-"""
